@@ -5,8 +5,8 @@
 // @icon         https://raw.githubusercontent.com/Aurzex/Nabeludo/main/icon.png
 // @version      5.5.3
 // @description  智能扫描课程、自动播放视频、自动发送学时（实时检查完成状态）。西北师大继续教育平台。
-// @author       Nabeludo Contributors (zfk & Aurzex)
-// @license      MIT
+// @author       Aurzex
+// @license      AGPL-3.0
 // @match        *://xbsd.lt-edu.net/*
 // @grant        GM_getValue
 // @grant        GM_setValue
