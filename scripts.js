@@ -3,7 +3,7 @@
 // @namespace    https://github.com/Aurzex/Nabeludo
 // @homepage     https://github.com/Aurzex/Nabeludo
 // @icon         https://raw.githubusercontent.com/Aurzex/Nabeludo/main/icon.png
-// @version      5.5.3
+// @version      5.5.4
 // @description  智能扫描课程、自动播放视频、自动发送学时（实时检查完成状态）。西北师大继续教育平台。
 // @author       Aurzex
 // @license      AGPL-3.0
@@ -27,6 +27,13 @@
     // ========== 工具函数 ==========
     const $ = (sel, ctx = document) => ctx.querySelector(sel);
     const $$ = (sel, ctx = document) => [...ctx.querySelectorAll(sel)];
+
+    // HTML 转义（防止 XSS）
+    function escapeHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
 
     async function asyncPool(limit, tasks) {
         const results = [];
@@ -93,6 +100,7 @@
         box.style.cssText = `
             background:#fff; border-radius:8px; padding:24px 32px; max-width:400px;
             box-shadow:0 4px 20px rgba(0,0,0,0.15); font-family:system-ui, sans-serif;
+            white-space: pre-wrap;
         `;
         box.innerHTML = `
             <h3 style="margin:0 0 12px;font-size:16px">${title}</h3>
@@ -339,7 +347,7 @@
             pendingOrder: [],
             vidIndex: -1,
             vidSends: 0,
-            vidTotalSends: 0,
+            // vidTotalSends 已移除 (未使用)
             failCount: 0,
             sendingLock: false,
             sendingVideo: null,
@@ -349,6 +357,8 @@
             autoPlayRunning: false,
             autoPlayTimer: null,
             autoPlayWaitTime: 0,
+            autoPlayLastVideo: null,   // 用于检测视频切换
+            autoPlayTriggered: false,  // 防止重复触发下一节
             uiTimer: null
         };
 
@@ -425,6 +435,9 @@
         }
 
         async function scanAll() {
+            // 扫描前停止自动发送，防止数据冲突
+            if (S.autoSending) stopAutoSend();
+
             const token = DOM.tokenInput.value.trim();
             const userId = DOM.userIdInput.value.trim();
             if (!token || !userId) { log('请先登录平台获取凭证', 'error'); return; }
@@ -496,6 +509,9 @@
                                 });
                             }
                         })
+                        .catch(err => {
+                            log(`获取目录细节失败 (cid=${cid}): ${err.message}`, 'warn');
+                        })
                 );
                 await asyncPool(5, tasks);
             }
@@ -539,14 +555,14 @@
 
                 const checked = S.selectedVideo === v ? 'checked' : '';
                 const disabled = status === STATUS.DONE ? 'disabled' : '';
-                const title = `${v.courseTitle} - ${v.title}`;
-                const duration = v.lengthStr;
+                const safeTitle = escapeHtml(`${v.courseTitle} - ${v.title}`);
+                const duration = escapeHtml(v.lengthStr);
                 const progress = S.progressCache[v.itemId] || 0;
                 const percent = v.lengthSeconds > 0 ? Math.round((progress / v.lengthSeconds) * 100) : 0;
                 return `
                     <div class="nbl-item ${cls}" data-idx="${idx}">
                         <input type="radio" name="vidSel" ${checked} ${disabled}>
-                        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${title}">${title}</span>
+                        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${safeTitle}">${safeTitle}</span>
                         <small style="color:#94a3b8;white-space:nowrap;">${duration} (${percent}%)</small>
                         ${tag}
                     </div>`;
@@ -612,16 +628,15 @@
 
             const remaining = Math.max(0, total - currentProgress);
             DOM.videoDetail.innerHTML = `
-                <span>课程包: ${video.courseTitle}</span>
-                <span>视频: ${video.title}</span>
-                <span>总时长: ${video.lengthStr}</span>
+                <span>课程包: ${escapeHtml(video.courseTitle)}</span>
+                <span>视频: ${escapeHtml(video.title)}</span>
+                <span>总时长: ${escapeHtml(video.lengthStr)}</span>
                 <span>已观看: ${formatTime(currentProgress)}</span>
                 <span>剩余: ${formatTime(remaining)}</span>
                 ${S.autoSending && S.sendingVideo === video ? `<span>发送次数: ${S.vidSends}</span>` : ''}
             `;
         }
 
-        // 获取视频详细信息（CID、状态、进度），强制从服务器获取最新状态
         async function checkVideoStatus(video) {
             log(`检查视频状态: ${video.title}`, 'debug');
             const data = await api(
@@ -650,7 +665,6 @@
         async function sendRecord(video) {
             log(`准备发送: ${video.courseTitle} - ${video.title}`, 'debug');
 
-            // 发送前先检查状态
             const info = await checkVideoStatus(video);
             if (!info?.cid) { log('获取CID失败', 'error'); return false; }
             if (info.status === STATUS.DONE) {
@@ -678,7 +692,6 @@
                     S.progressCache[video.itemId] = data.data.now;
                 }
 
-                // 发送后立即检查视频是否完成
                 const updatedInfo = await checkVideoStatus(video);
                 const completed = updatedInfo?.status === STATUS.DONE;
 
@@ -728,7 +741,6 @@
                 return;
             }
 
-            // 重建队列（过滤已完成）
             if (S.pendingOrder.length === 0 || S.vidIndex >= S.pendingOrder.length) {
                 S.pendingOrder = buildPendingOrder();
                 S.vidIndex = -1;
@@ -768,30 +780,30 @@
             updateProgressInfo(video);
 
             S.sendingLock = true;
-            const result = await sendRecord(video);
-            S.sendingLock = false;
-
-            if (result) {
-                S.failCount = 0;
-                if (result.completed) {
-                    // 视频已完成，移出队列，跳转下一个
-                    S.pendingOrder.splice(S.vidIndex, 1);
-                    S.sendingVideo = null;
-                    log(`视频完成，队列剩余 ${S.pendingOrder.length} 个`, 'debug');
-                    if (S.pendingOrder.length === 0) {
-                        log('所有视频均已完成！', 'success');
-                        stopAutoSend();
-                        return;
+            try {
+                const result = await sendRecord(video);
+                if (result) {
+                    S.failCount = 0;
+                    if (result.completed) {
+                        S.pendingOrder.splice(S.vidIndex, 1);
+                        S.sendingVideo = null;
+                        log(`视频完成，队列剩余 ${S.pendingOrder.length} 个`, 'debug');
+                        if (S.pendingOrder.length === 0) {
+                            log('所有视频均已完成！', 'success');
+                            stopAutoSend();
+                            return;
+                        }
+                        if (S.vidIndex >= S.pendingOrder.length) {
+                            S.vidIndex = 0;
+                        }
                     }
-                    // vidIndex 不变，因为 splice 后当前索引指向下一个视频
-                    if (S.vidIndex >= S.pendingOrder.length) {
-                        S.vidIndex = 0;
-                    }
+                } else {
+                    S.failCount++;
+                    log(`连续失败次数: ${S.failCount}`, 'debug');
                 }
-                // 如果未完成，继续当前视频（vidIndex 不变）
-            } else {
-                S.failCount++;
-                log(`连续失败次数: ${S.failCount}`, 'debug');
+            } finally {
+                // 确保锁一定被释放，防止死锁
+                S.sendingLock = false;
             }
 
             updateUI();
@@ -805,6 +817,10 @@
             S.pendingOrder = buildPendingOrder();
             if (S.pendingOrder.length === 0) {
                 log('没有可发送的视频', 'warn');
+                // 修复：无视频时重置状态，避免按钮卡死
+                S.autoSending = false;
+                DOM.autoSendBtn.disabled = false;
+                DOM.stopSendBtn.disabled = true;
                 return;
             }
             S.vidIndex = -1;
@@ -859,6 +875,18 @@
             }
         }
 
+        // 尝试点击下一节按钮（用于自动播放切换）
+        function tryPlayNextChapter() {
+            const next = document.querySelector(".video_round:not(.study)");
+            if (!next) return false;
+            next.nextElementSibling?.click(); // 播放按钮
+            setTimeout(() => {
+                const btn = document.querySelector(".el-message-box button");
+                if (btn && btn.textContent.includes('确定')) btn.click();
+            }, 500);
+            return true;
+        }
+
         function startAutoPlayCourse() {
             if (S.autoPlayRunning) return;
             if (!location.href.includes('/index/classStudy?')) {
@@ -867,16 +895,16 @@
             }
             S.autoPlayRunning = true;
             S.autoPlayWaitTime = 0;
+            S.autoPlayTriggered = false;
+            S.autoPlayLastVideo = null;
             DOM.autoPlayBtn.disabled = true;
             DOM.stopAutoPlayBtn.disabled = false;
 
-            const next = document.querySelector(".video_round:not(.study)");
-            if (!next) { log('当前课程已完成', 'info'); stopAutoPlayCourse(); return; }
-            next.nextElementSibling?.click();
-            setTimeout(() => {
-                const btn = document.querySelector(".el-message-box button");
-                if (btn && btn.textContent.includes('确定')) btn.click();
-            }, 500);
+            if (!tryPlayNextChapter()) {
+                log('当前课程已完成', 'info');
+                stopAutoPlayCourse();
+                return;
+            }
             log('自动播放已启动', 'success');
 
             if (S.autoPlayTimer) clearInterval(S.autoPlayTimer);
@@ -887,6 +915,8 @@
             S.autoPlayRunning = false;
             if (S.autoPlayTimer) { clearInterval(S.autoPlayTimer); S.autoPlayTimer = null; }
             S.autoPlayWaitTime = 0;
+            S.autoPlayTriggered = false;
+            S.autoPlayLastVideo = null;
             DOM.autoPlayBtn.disabled = false;
             DOM.stopAutoPlayBtn.disabled = true;
             log('自动播放已停止', 'info');
@@ -894,17 +924,39 @@
 
         function autoPlayLoop() {
             if (!S.autoPlayRunning) return;
-            if (S.autoPlayWaitTime > 0) { S.autoPlayWaitTime -= 2; return; }
             const video = getVideo();
             if (!video) return;
-            video.volume = 0;
-            if (video.duration > 0 && video.currentTime + 5 >= video.duration) {
-                S.autoPlayWaitTime = 15;
-                log('视频即将结束，准备切换到下一集', 'info');
-                setTimeout(() => { top.location.reload(); }, 3000);
+
+            // 检测视频是否切换，重置状态
+            if (S.autoPlayLastVideo !== video) {
+                S.autoPlayLastVideo = video;
+                S.autoPlayWaitTime = 0;
+                S.autoPlayTriggered = false;
+            }
+
+            if (S.autoPlayWaitTime > 0) {
+                S.autoPlayWaitTime -= 2;
                 return;
             }
-            if (video.paused) { video.play().catch(() => {}); }
+            if (S.autoPlayTriggered) return;
+
+            video.volume = 0;
+            if (video.duration > 0 && video.currentTime + 5 >= video.duration) {
+                S.autoPlayTriggered = true;
+                S.autoPlayWaitTime = 9999; // 防止重复触发
+                log('视频即将结束，尝试切换到下一节...', 'info');
+                setTimeout(() => {
+                    if (!tryPlayNextChapter()) {
+                        log('没有下一节了，自动播放已停止', 'info');
+                        stopAutoPlayCourse();
+                    }
+                }, 3000);
+                return;
+            }
+
+            if (video.paused) {
+                video.play().catch(() => {});
+            }
         }
 
         window.addEventListener('beforeunload', () => {
@@ -953,6 +1005,8 @@
 
             DOM.scanBtn.addEventListener('click', scanAll);
             DOM.clearBtn.addEventListener('click', () => {
+                // 清空前停止自动发送，避免数据冲突
+                if (S.autoSending) stopAutoSend();
                 DOM.tokenInput.value = '';
                 DOM.userIdInput.value = '';
                 S.courses = []; S.videos = []; S.cidCache = {}; S.statusCache = {}; S.progressCache = {};
@@ -1020,7 +1074,7 @@
             });
             DOM.closeBtn.addEventListener('click', () => app.classList.toggle('hidden'));
 
-            log('Nabeludo v5.5.3 已就绪', 'success');
+            log('Nabeludo v5.5.4 已就绪', 'success');
         }
 
         init();
